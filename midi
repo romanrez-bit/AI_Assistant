@@ -1,0 +1,97 @@
+ create_midi.py
+import mido
+from mido import Message, MidiFile, MidiTrack, MetaMessage, bpm2tempo
+
+TICKS_PER_BEAT = 480
+mid = MidiFile(ticks_per_beat=TICKS_PER_BEAT)
+
+tempo = bpm2tempo(170)  # 170 BPM
+
+# Утилиты
+def beats_to_ticks(beats):
+    return int(beats * TICKS_PER_BEAT)
+
+def add_note_event(events, start_beat, duration_beats, channel, note, velocity=100):
+    start = beats_to_ticks(start_beat)
+    end = start + beats_to_ticks(duration_beats)
+    events.append((start, Message('note_on', channel=channel, note=note, velocity=velocity)))
+    events.append((end,   Message('note_off', channel=channel, note=note, velocity=0)))
+
+def add_chord(events, start_beat, duration_beats, channel, notes, velocity=100):
+    for n in notes:
+        add_note_event(events, start_beat, duration_beats, channel, n, velocity)
+
+# Создаём дорожки: tempo + мета, затем инструменты
+meta_track = MidiTrack()
+meta_track.append(MetaMessage('set_tempo', tempo=tempo, time=0))
+meta_track.append(MetaMessage('track_name', name='Ustal_no_idu_master', time=0))
+mid.tracks.append(meta_track)
+
+# Планы партий в виде событий (tick, message)
+# Каналы: 0 - гитара, 1 - виолончель, 2 - скрипка, 9 - барабаны (перкуссия), 3 - вокал/мелодия
+guitar_events = []
+cello_events = []
+violin_events = []
+drums_events = []
+vocal_events = []
+
+# Простая структура в тактах/ударах (170 BPM => 170 тактов в минуту)
+# Разбивка по долям (в битах) — мы используем «beats» как доли четверти
+
+# ГИТАРА (пауэр‑аккорды), используем корни в низком регистре
+# Номера MIDI нот (низкий диапазон): E3=52, G3=55, A3=57, C4=60, D4=62, E4=64
+pattern = [
+    (0.0, 2.0, [52, 59]),   # E (интро)
+    (2.0, 2.0, [55, 62]),   # G
+    (4.0, 2.0, [57, 64]),   # A
+    (6.0, 2.0, [52, 59]),   # E
+]
+# Повторим этот цикл 6 раз (примерно 24 beats ~ 8.5 сек)
+for cycle in range(6):
+    base = cycle * 8.0
+    for start, dur, notes in pattern:
+        add_chord(guitar_events, base + start, dur, channel=0, notes=notes, velocity=100)
+
+# Припев: C5 G5 D5 E5 (но в средних октавах)
+# C4=60, G3=55, D4=62, E4=64 -> используем парные пятки
+chorus = [
+    (48.0, 4.0, [60, 67]),   # C
+    (52.0, 4.0, [55, 62]),   # G
+    (56.0, 4.0, [62, 69]),   # D
+    (60.0, 4.0, [64, 71]),   # E
+]
+for start, dur, notes in chorus:
+    add_chord(guitar_events, start, dur, channel=0, notes=notes, velocity=110)
+# Повтор припева дважды
+for start, dur, notes in [(s+16.0, d, n) for (s,d,n) in chorus]:
+    add_chord(guitar_events, start, dur, channel=0, notes=notes, velocity=110)
+
+# ВИОЛОНЧЕЛЬ (низкие длительные ноты под аккорды) - E2=40, C3=48, D3=50
+# Простые удержания синкопами
+for start, dur, notes in pattern:
+    add_chord(cello_events, start, dur, channel=1, notes=[40], velocity=90)
+for start, dur, notes in chorus:
+    # смещение на ту же длительность припева
+    add_chord(cello_events, start, dur*2, channel=1, notes=[40 if notes[0]==60 else notes[0]-12], velocity=100)
+
+# СКРИПКА — короткие ударные акценты и скримовые фразы
+# Используем выше расположенные ноты: B4=71, C5=72, E5=76
+# Акценты в конце каждой 2-битовой фразы
+for i in range(0, 48, 2):
+    add_note_event(violin_events, i + 1.5, 0.25, channel=2, note=71, velocity=110)  # акцент
+
+# БРИДЖ/СОЛО (скрипка)
+for i in range(108, 116):
+    if i % 1 == 0:
+        add_note_event(violin_events, i/1.0, 0.5, channel=2, note=76 - (i % 4)*2, velocity=120)
+
+# БАРАБАНЫ (перкуссия на канале 9; ноты GM: BD=36, SD=38, CH=42, CRS=49)
+# Хай-хет на восьмых (каждые 0.5 бита), бас на 1 и 3, снейр на 2 и 4
+for beat in range(0, 170):
+    # hi-hat every 0.5 beat
+    add_note_event(drums_events, beat + 0.0, 0.1, channel=9, note=42, velocity=70)
+    add_note_event(drums_events, beat + 0.5, 0.1, channel=9, note=42, velocity=70)
+    if beat % 4 == 0:
+        add_note_event(drums_events, beat + 0.0, 0.1, channel=9, note=36, velocity=110)  # bass
+    if beat % 4 == 2:
+        add_note_event(drums_events, beat + 0.0, 0.1, channel=9, note=38, velocity=120)  # snare

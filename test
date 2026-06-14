@@ -1,0 +1,9 @@
+import sounddevice as sd
+import numpy as np
+
+def callback(indata, frames, time, status):
+    volume = np.linalg.norm(indata) * 10
+    print(f"Уровень: {volume:.2f}")
+
+with sd.InputStream(samplerate=16000, channels=1, callback=callback):
+    input("Говорите что-нибудь и нажмите Enter для выхода...")
