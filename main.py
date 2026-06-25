@@ -1,7 +1,31 @@
+# -*- coding: utf-8 -*-
 """
 Умный голосовой помощник с распознаванием лиц.
-Версия: v8 (Исправлены все остатки кириллицы в OpenCV и заголовки окон)
+
+Изменения в этой версии (v5):
+- Распознавание лиц переведено на LBPH (cv2.face.LBPHFaceRecognizer) —
+  это настоящий ML-алгоритм на основе текстурных гистограмм, входит в
+  opencv-contrib-python, не требует dlib/CMake.
+- Озвучка переведена на Microsoft Edge TTS (библиотека edge-tts) —
+  два приятных нейросетевых голоса: ru-RU-DmitryNeural (мужской) и
+  ru-RU-SvetlanaNeural (женский). Нужен интернет. SAPI оставлен как
+  запасной вариант, если edge-tts недоступен (нет сети).
+- Новые команды: погода (wttr.in, без API-ключа), открыть браузер/сайт,
+  шутка, интересный факт, калькулятор, цитата дня.
+- В окне распознавания: вероятность (confidence, %) — верхний левый
+  угол; описание алгоритма — нижний правый угол; всё это построчно
+  пишется в лог-файл до момента закрытия окна камеры.
+- GUI: все команды доступны как кнопки в левой панели; всё это же
+  работает и голосом, и через текстовый ввод.
+
+Установка зависимостей (Windows, PyCharm, терминал):
+    pip install opencv-contrib-python pillow pywin32 vosk sounddevice
+    pip install edge-tts playsound3 requests
+
+Модель Vosk должна лежать в папке vosk-model-small-ru-0.22 рядом со
+скриптом (распаковать архив с https://alphacephei.com/vosk/models).
 """
+
 import os
 import sys
 import json
@@ -14,6 +38,7 @@ import threading
 import webbrowser
 import tempfile
 from datetime import datetime
+
 import cv2
 import numpy as np
 import requests
@@ -25,7 +50,6 @@ from PIL import Image, ImageDraw, ImageFont
 # --- Vosk (распознавание речи) ---
 try:
     from vosk import Model, KaldiRecognizer
-
     VOSK_AVAILABLE = True
 except ImportError:
     VOSK_AVAILABLE = False
@@ -34,7 +58,6 @@ except ImportError:
 # --- SAPI (запасной голос, если нет интернета) ---
 try:
     import win32com.client
-
     SAPI_AVAILABLE = True
 except ImportError:
     SAPI_AVAILABLE = False
@@ -43,7 +66,6 @@ except ImportError:
 # --- edge-tts (основной, приятный голос) ---
 try:
     import edge_tts
-
     EDGE_TTS_AVAILABLE = True
 except ImportError:
     EDGE_TTS_AVAILABLE = False
@@ -52,11 +74,11 @@ except ImportError:
 # --- playsound3 (проигрывание mp3 от edge-tts) ---
 try:
     from playsound3 import playsound
-
     PLAYSOUND_AVAILABLE = True
 except ImportError:
     PLAYSOUND_AVAILABLE = False
     print("playsound3 не установлен. Установите: pip install playsound3")
+
 
 # ================= НАСТРОЙКИ =================
 MODEL_PATH = "vosk-model-small-ru-0.22"
@@ -66,8 +88,11 @@ LBPH_MODEL_FILE = "lbph_model.yml"
 UNKNOWN_PHRASE = "Кто ты, человек?"
 LOG_DIR = "recognition_logs"
 
+# Пороговое значение LBPH (расстояние; меньше = увереннее).
+# Подобрано эмпирически: < 60 — уверенное совпадение.
 LBPH_DISTANCE_THRESHOLD = 60
 
+# Описание алгоритма для отображения в правом нижнем углу
 ALGORITHM_DESCRIPTION = [
     "ALGORITHM: LBPH (Local Binary Patterns Histograms)",
     "1. GRAYSCALE & RESIZE (200x200)",
@@ -78,13 +103,22 @@ ALGORITHM_DESCRIPTION = [
     "6. CONFIDENCE % = 100 - MIN(DISTANCE, 100)",
 ]
 
+# Голоса edge-tts (приятные нейро-голоса). Профилей больше нет — один
+# ассистент ("Друг"), голос выбирается вручную в GUI и не меняется
+# автоматически по распознанному лицу.
 EDGE_VOICES = {
     "Дмитрий (муж.)": "ru-RU-DmitryNeural",
     "Светлана (жен.)": "ru-RU-SvetlanaNeural",
 }
+DEFAULT_VOICE_NAME = "Дмитрий (муж.)"
 
-ASSISTANT_NAME = "друг"
-DEFAULT_VOICE = "Дмитрий (муж.)"
+# Ключевое слово, с которого должна начинаться голосовая команда.
+# В тексте/кнопках GUI это слово не требуется.
+WAKE_WORD = "друг"
+
+# Имена для отображения в окне распознавания. ИИ распознаёт по базе лиц
+# (известные имена), а для неизвестного лица показывается это слово.
+UNKNOWN_LABEL = "Неизвестен"
 
 # ================= КОНТЕНТ ДЛЯ КОМАНД =================
 JOKES = [
@@ -103,17 +137,9 @@ FACTS = [
     "Один день на Венере длиннее, чем один год на Венере.",
     "Бананы — это ягоды, а клубника — нет.",
     "Человеческий мозг потребляет около 20% всей энергии тела.",
-    "Самый короткий war в истории длился 38 минут — между Занзибаром и Великобританией.",
+    "Самая короткая война в истории длилась 38 минут — между Занзибаром и Великобританией.",
     "Улитки могут спать до трёх лет подряд.",
 ]
-
-SMALL_TALK = {
-    "как дела": ["У меня всё хорошо. Спасибо, что спросил.", "Отлично. Готов помочь.", "Работаю и рад тебя слышать."],
-    "как настроение": ["Настроение отличное.", "Сегодня замечательный день.", "Настроение рабочее и позитивное."],
-    "что нового": ["Изучаю новые команды.", "Пока всё спокойно.", "Готов узнавать новое вместе с тобой."],
-    "скучно": ["Нет, мне нравится общаться.", "Я всегда готов помочь."],
-    "кто ты": ["Я голосовой помощник Друг.", "Я твой цифровой помощник."]
-}
 
 QUOTES = [
     "Лучший способ начать — это перестать говорить и начать делать.",
@@ -124,24 +150,50 @@ QUOTES = [
     "Лучшее время посадить дерево было двадцать лет назад. Следующее лучшее время — сейчас.",
 ]
 
+# Эмпатичные реплики на простые личные вопросы. Ключ — список фраз-триггеров,
+# значение — варианты ответа (выбирается случайно, чтобы не звучало роботизированно).
+EMPATHY_RESPONSES = [
+    (["как дела", "как у тебя дела", "как жизнь"],
+     ["Спасибо, что спросил! У меня всё отлично, я готов помогать.",
+      "Всё хорошо, работаю в обычном режиме и рад быть полезным.",
+      "Дела хорошо, особенно когда есть с кем поговорить!"]),
+    (["как настроение", "какое у тебя настроение"],
+     ["Настроение бодрое, готов к работе!",
+      "Настроение хорошее, спасибо, что интересуешься.",
+      "Чувствую себя отлично, давай чем-нибудь займёмся."]),
+    (["как ты", "ты как"],
+     ["Я в порядке, спасибо! А у тебя как дела?",
+      "Всё хорошо, спасибо за заботу."]),
+    (["что делаешь", "чем занимаешься", "что нового"],
+     ["Слушаю тебя и готов помочь — с погодой, лицами, шутками, чем угодно.",
+      "Жду твоих команд, ничего не пропускаю."]),
+    (["спасибо"],
+     ["Пожалуйста! Обращайся в любое время.",
+      "Рад был помочь!",
+      "Всегда пожалуйста."]),
+    (["устал", "устала", "грустно", "плохое настроение", "плохо"],
+     ["Жаль это слышать. Если хочешь — расскажу шутку или интересный факт, чтобы немного отвлечься.",
+      "Понимаю. Иногда помогает небольшая пауза. Могу рассказать что-нибудь интересное, если хочешь."]),
+    (["я тебя люблю", "ты молодец", "ты хороший"],
+     ["Очень приятно это слышать, спасибо!",
+      "Спасибо тебе! Стараюсь быть полезным."]),
+]
+
 
 class SmartAssistant:
     def __init__(self):
-        self.current_voice_name = DEFAULT_VOICE
         self.is_recognizing_faces = False
         self.is_listening = True
-
-        self.last_name = "Нет данных"
-        self.last_confidence = 0
-        self.last_distance = 0.0
-
-        self.last_greeted_name = ""
-        self.last_greeted_time = 0
 
         self.audio_queue = queue.Queue()
         self.speak_queue = queue.Queue()
         self.listen_thread = None
 
+        # Текущий голос edge-tts (короткое имя из EDGE_VOICES). Один голос
+        # для всего ассистента, профилей и авто-смены по лицу больше нет.
+        self.current_voice_name = DEFAULT_VOICE_NAME
+
+        # Лок для безопасного доступа к базе лиц из разных потоков
         self.faces_lock = threading.Lock()
 
         # 1. GUI
@@ -156,17 +208,24 @@ class SmartAssistant:
         self.speaker_thread.start()
 
         # 3. Распознавание лиц (LBPH)
-        self.known_names = {}
+        self.known_names = {}   # label_id (int) -> имя
         self.next_label_id = 0
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         self.font = self.load_cyrillic_font()
         self.last_spoken_name = ""
         self.last_spoken_time = 0
-        self.speak_cooldown = 5.0
-        self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=8, grid_x=8, grid_y=8)
+        self.speak_cooldown = 3.0
+        self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=8,
+                                                               grid_x=8, grid_y=8)
         self.model_trained = False
         self.recognition_log_file = None
+        # Последний результат распознавания на лицо — чтобы рисовать
+        # рамку/подпись/вероятность на КАЖДОМ кадре, а не только в момент
+        # пересчёта (иначе текст мигает/пропадает между обновлениями).
+        # Формат: {face_key: {"name", "confidence_pct", "distance", "color",
+        #                      "box", "last_update"}}
+        self.last_results = {}
         self.load_face_data()
 
         # 4. Голосовой ввод
@@ -179,6 +238,8 @@ class SmartAssistant:
 
     # ================= ИНИЦИАЛИЗАЦИЯ ГОЛОСА =================
     def init_sapi_speaker(self):
+        """Запасной голос через Windows SAPI (используется только если
+        edge-tts недоступен — например, нет интернета)."""
         try:
             speaker = win32com.client.Dispatch("SAPI.SpVoice")
             speaker.Rate = 0
@@ -197,10 +258,12 @@ class SmartAssistant:
             self.speak_queue.task_done()
 
     def _speak_now(self, text: str):
+        """Озвучивает текст: пытается edge-tts, при ошибке падает на SAPI."""
         if EDGE_TTS_AVAILABLE and PLAYSOUND_AVAILABLE:
             try:
                 voice_id = EDGE_VOICES.get(self.current_voice_name, "ru-RU-DmitryNeural")
-                tmp_path = os.path.join(tempfile.gettempdir(), f"assistant_tts_{int(time.time() * 1000)}.mp3")
+                tmp_path = os.path.join(tempfile.gettempdir(),
+                                         f"assistant_tts_{int(time.time()*1000)}.mp3")
                 asyncio.run(self._edge_tts_save(text, voice_id, tmp_path))
                 playsound(tmp_path)
                 try:
@@ -244,68 +307,84 @@ class SmartAssistant:
 
     def setup_gui(self):
         self.root = tk.Tk()
-        self.root.title("Умный Помощник + Распознавание Лиц (LBPH)")
+        self.root.title("Друг — Умный Помощник с Распознаванием Лиц (LBPH)")
         self.root.geometry("1000x700")
         self.root.configure(bg="#f0f0f0")
 
+        # Верхняя панель
         top_frame = tk.Frame(self.root, bg="#2c3e50", height=60)
         top_frame.pack(fill=tk.X)
 
-        tk.Label(top_frame, text="Голос:", fg="white", bg="#2c3e50").pack(side=tk.LEFT, padx=10, pady=15)
+        tk.Label(top_frame, text="🤖 Друг", fg="white", bg="#2c3e50",
+                 font=("Arial", 13, "bold")).pack(side=tk.LEFT, padx=15, pady=15)
+
+        tk.Label(top_frame, text="Голос:", fg="white", bg="#2c3e50").pack(
+            side=tk.LEFT, padx=(20, 5), pady=15)
         self.voice_var = tk.StringVar(value=self.current_voice_name)
         self.voice_combo = ttk.Combobox(top_frame, textvariable=self.voice_var,
-                                        values=list(EDGE_VOICES.keys()), state="readonly", width=18)
+                                         values=list(EDGE_VOICES.keys()),
+                                         state="readonly", width=18)
         self.voice_combo.pack(side=tk.LEFT, padx=5, pady=15)
         self.voice_combo.bind("<<ComboboxSelected>>", self.update_voice_from_gui)
 
         tk.Label(top_frame, text="Микрофон: Активен", fg="#2ecc71", bg="#2c3e50",
                  font=("Arial", 10, "bold")).pack(side=tk.RIGHT, padx=15, pady=15)
 
+        # Основная область
         main_frame = tk.Frame(self.root, bg="#f0f0f0")
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
+        # Левая панель управления (все команды здесь)
         control_frame = tk.LabelFrame(main_frame, text="Управление", bg="#f0f0f0", width=240)
         control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         control_frame.pack_propagate(False)
+
         self._build_control_buttons(control_frame)
 
+        # Лог справа
         log_frame = tk.LabelFrame(main_frame, text="Журнал", bg="#f0f0f0")
         log_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.log_area = scrolledtext.ScrolledText(log_frame, state='disabled', font=("Consolas", 10))
+        self.log_area = scrolledtext.ScrolledText(log_frame, state='disabled',
+                                                   font=("Consolas", 10))
         self.log_area.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
+        # Ввод команд
         input_frame = tk.Frame(self.root, bg="#f0f0f0")
         input_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
         self.command_entry = ttk.Entry(input_frame, font=("Arial", 12))
         self.command_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         self.command_entry.bind("<Return>", lambda event: self.send_command_from_gui())
-        ttk.Button(input_frame, text="Отправить", command=self.send_command_from_gui).pack(side=tk.RIGHT)
+        ttk.Button(input_frame, text="Отправить", command=self.send_command_from_gui).pack(
+            side=tk.RIGHT)
 
-        self.log_to_gui("Система запущена.")
+        self.log_to_gui("Система запущена. Ассистент «Друг» к работе готов.")
 
     def _build_control_buttons(self, parent):
+        """Все команды ассистента доступны как кнопки в левой панели."""
         sections = [
             ("Лица", [
-                ("Камера / распознавание", lambda: self.process_command("друг распознавание")),
-                ("Добавить лицо", lambda: self.process_command("друг добавь человека")),
-                ("Список базы", lambda: self.process_command("друг список")),
-                ("Удалить из базы", lambda: self.process_command("друг удали папу")),
-                ("Очистить базу", lambda: self.process_command("друг очисти базу")),
+                ("Камера / распознавание", lambda: self.process_command("распознавание")),
+                ("Добавить лицо", lambda: self.process_command("добавь человека")),
+                ("Список базы", lambda: self.process_command("список")),
+                ("Удалить из базы", lambda: self.delete_person_by_dialog()),
+                ("Очистить базу", lambda: self.process_command("очисти базу")),
             ]),
             ("Информация", [
-                ("Погода", lambda: self.process_command("друг погода")),
-                ("Который час", lambda: self.process_command("друг который час")),
-                ("Шутка", lambda: self.process_command("друг расскажи шутку")),
-                ("Интересный факт", lambda: self.process_command("друг интересный факт")),
-                ("Цитата дня", lambda: self.process_command("друг цитата дня")),
+                ("Погода", lambda: self.process_command("погода")),
+                ("Который час", lambda: self.process_command("который час")),
+                ("Шутка", lambda: self.process_command("расскажи шутку")),
+                ("Интересный факт", lambda: self.process_command("интересный факт")),
+                ("Цитата дня", lambda: self.process_command("цитата дня")),
             ]),
             ("Инструменты", [
-                ("Открыть браузер", lambda: self.process_command("друг открой браузер")),
-                ("Калькулятор: пример", lambda: self.process_command("друг сколько будет 2 плюс 2")),
+                ("Открыть браузер", lambda: self.process_command("открой браузер")),
+                ("Калькулятор: пример", lambda: self.process_command("сколько будет 2 плюс 2")),
             ]),
             ("Прочее", [
+                ("Как дела?", lambda: self.process_command("как дела")),
+                ("Как настроение?", lambda: self.process_command("как настроение")),
                 ("Справка", self.show_help),
-                ("Стоп / Выход", lambda: self.process_command("друг стоп")),
+                ("Стоп / Выход", lambda: self.process_command("стоп")),
             ]),
         ]
         for title, buttons in sections:
@@ -329,21 +408,31 @@ class SmartAssistant:
 
     def show_help(self):
         messagebox.showinfo("Справка",
-                            "Команды (голосом, текстом или кнопками):\n"
-                            "- 'Друг, запусти распознавание' / 'камера'\n"
-                            "- 'Друг, добавь [имя]'\n"
-                            "- 'Друг, удали [имя]'\n"
-                            "- 'Друг, очисти базу'\n"
-                            "- 'Друг, список' — кто в базе\n"
-                            "- 'Друг, который час?'\n"
-                            "- 'Друг, погода [в городе]'\n"
-                            "- 'Друг, открой браузер' / 'ютуб'\n"
-                            "- 'Друг, расскажи шутку'\n"
-                            "- 'Друг, интересный факт'\n"
-                            "- 'Друг, цитата дня'\n"
-                            "- 'Друг, сколько будет 5 плюс 3'\n"
-                            "- 'Друг, как дела' / 'кто ты'\n"
-                            "- 'Друг, стоп'")
+            "Голосовые команды начинаются со слова «Друг», например:\n"
+            "«Друг, погода», «Друг, расскажи шутку».\n"
+            "В тексте и кнопках слово «Друг» не нужно.\n\n"
+            "Доступные команды:\n"
+            "- 'Запусти распознавание' / 'камера'\n"
+            "- 'Добавь [имя]'\n"
+            "- 'Удали [имя]'\n"
+            "- 'Очисти базу'\n"
+            "- 'Список' — кто в базе\n"
+            "- 'Который час?'\n"
+            "- 'Погода [в городе]'\n"
+            "- 'Открой браузер' / 'открой ютуб'\n"
+            "- 'Расскажи шутку'\n"
+            "- 'Интересный факт'\n"
+            "- 'Цитата дня'\n"
+            "- 'Сколько будет 5 плюс 3'\n"
+            "- 'Как дела?', 'Как настроение?' — простые вопросы\n"
+            "- 'Стоп'")
+
+    def delete_person_by_dialog(self):
+        name = simpledialog_askstring("Удаление", "Введите имя человека для удаления:")
+        if name:
+            self.delete_person(name.strip())
+        else:
+            self.speak("Отменено.")
 
     def load_cyrillic_font(self):
         for path in ["C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/calibri.ttf"]:
@@ -379,47 +468,55 @@ class SmartAssistant:
             self.log_to_gui(f"Ошибка Vosk: {e}")
 
     def start_audio_stream(self):
-        if not self.vosk_recognizer: return
+        if not self.vosk_recognizer:
+            return
         self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.listen_thread.start()
 
     def _listen_loop(self):
         def audio_callback(indata, frames, time_info, status):
             self.audio_queue.put((indata * 32767).astype(np.int16).tobytes())
-
         try:
-            with sd.InputStream(samplerate=SAMPLE_RATE, blocksize=8000, channels=1, callback=audio_callback):
+            with sd.InputStream(samplerate=SAMPLE_RATE, blocksize=8000, channels=1,
+                                 callback=audio_callback):
                 while self.is_listening:
                     data = self.audio_queue.get()
                     if self.vosk_recognizer.AcceptWaveform(data):
                         text = json.loads(self.vosk_recognizer.Result()).get("text", "").strip().lower()
                         if text:
-                            self.log_to_gui(f"Голос: {text}")
-                            self.process_command(text)
+                            self.log_to_gui(f"Голос (распознано): {text}")
+                            command = self._strip_wake_word(text)
+                            if command is not None:
+                                self.process_command(command)
+                            # Если в фразе не было слова "друг" — игнорируем
+                            # её как случайную/фоновую речь.
         except Exception as e:
             self.log_to_gui(f"Ошибка аудио: {e}")
+
+    @staticmethod
+    def _strip_wake_word(text: str):
+        """Голосовые команды должны начинаться с ключевого слова (WAKE_WORD,
+        по умолчанию «друг»). Возвращает остаток фразы без этого слова,
+        либо None, если ключевого слова не было (фраза игнорируется)."""
+        text = text.strip().lower()
+        if text == WAKE_WORD or text.startswith(WAKE_WORD + " ") or \
+           text.startswith(WAKE_WORD + ","):
+            rest = text[len(WAKE_WORD):].lstrip(", ").strip()
+            return rest
+        return None
 
     # ================= ОБРАБОТКА КОМАНД =================
     def process_command(self, command: str):
         command = command.strip().lower()
-        if not command.startswith("друг"): return
-
-        command = command[4:].strip()
         if not command:
-            self.speak("Слушаю.")
             return
-
-        for phrase, answers in SMALL_TALK.items():
-            if phrase in command:
-                self.speak(random.choice(answers))
-                return
 
         if any(w in command for w in ['справка', 'помощь']):
             self.show_help()
             return
 
-        if "удали " in command or "забудь " in command:
-            name = command.replace("удали ", "").replace("забудь ", "").replace("из базы ", "").strip()
+        if "удали" in command or "забудь" in command:
+            name = command.replace("удали", "").replace("забудь", "").replace("из базы", "").strip()
             if name:
                 self.delete_person(name)
             else:
@@ -431,7 +528,8 @@ class SmartAssistant:
                 self.known_names = {}
                 self.next_label_id = 0
                 self.model_trained = False
-                self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=8, grid_x=8, grid_y=8)
+                self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=8,
+                                                                       grid_x=8, grid_y=8)
             self.save_face_data()
             self.speak("База полностью очищена.")
             return
@@ -463,7 +561,8 @@ class SmartAssistant:
             self.handle_weather(command)
             return
 
-        if any(w in command for w in ['открой браузер', 'открой сайт']) or command.startswith('открой'):
+        if any(w in command for w in ['открой браузер', 'открой сайт']) or \
+           command.startswith('открой '):
             self.handle_browser(command)
             return
 
@@ -493,15 +592,31 @@ class SmartAssistant:
             self.root.quit()
             sys.exit(0)
 
+        empathy_reply = self._match_empathy(command)
+        if empathy_reply:
+            self.speak(empathy_reply)
+            return
+
         self.log_to_gui("Команда не распознана.")
+
+    @staticmethod
+    def _match_empathy(command: str):
+        """Ищет совпадение с простыми личными вопросами (как дела, как
+        настроение и т.п.) и возвращает случайный тёплый ответ, либо None."""
+        for triggers, replies in EMPATHY_RESPONSES:
+            if any(trigger in command for trigger in triggers):
+                return random.choice(replies)
+        return None
 
     # ================= НОВЫЕ ФУНКЦИИ =================
     def handle_weather(self, command: str):
+        """Погода через wttr.in, без API-ключа."""
         city = "Warsaw"
-        for prefix in ["погода в ", "погода для ", "погода "]:
+        for prefix in ["погода в", "погода для", "погода"]:
             if prefix in command:
                 rest = command.split(prefix, 1)[1].strip()
-                if rest: city = rest
+                if rest:
+                    city = rest
                 break
 
         def worker():
@@ -520,9 +635,12 @@ class SmartAssistant:
 
     def handle_browser(self, command: str):
         sites = {
-            "ютуб": "https://youtube.com", "youtube": "https://youtube.com",
-            "гугл": "https://google.com", "google": "https://google.com",
-            "почту": "https://mail.google.com", "почта": "https://mail.google.com",
+            "ютуб": "https://youtube.com",
+            "youtube": "https://youtube.com",
+            "гугл": "https://google.com",
+            "google": "https://google.com",
+            "почту": "https://mail.google.com",
+            "почта": "https://mail.google.com",
         }
         for key, url in sites.items():
             if key in command:
@@ -539,7 +657,8 @@ class SmartAssistant:
 
     def handle_calculator(self, command: str):
         words_to_ops = {
-            'плюс': '+', 'минус': '-', 'умножить на': '*', 'умножить': '*',
+            'плюс': '+', 'минус': '-',
+            'умножить на': '*', 'умножить': '*',
             'разделить на': '/', 'разделить': '/',
         }
         text = command
@@ -569,16 +688,19 @@ class SmartAssistant:
             else:
                 self.speak("Не понял операцию.")
                 return
-            self.speak(f"Результат: {result:g}")
+            result_str = f"{result:g}"
+            self.speak(f"Результат: {result_str}")
         except Exception:
             self.speak("Не удалось вычислить пример.")
 
     # ================= РАСПОЗНАВАНИЕ ЛИЦ (LBPH) =================
     def load_face_data(self):
+        """Загружает сохранённые лица и переобучает LBPH-модель."""
         if os.path.exists(DATA_FILE):
             try:
                 with open(DATA_FILE, 'rb') as f:
                     saved = pickle.load(f)
+                # saved: {'names': {label: name}, 'samples': {label: [images]}}
                 self.known_names = saved.get('names', {})
                 samples = saved.get('samples', {})
                 self.next_label_id = (max(self.known_names.keys()) + 1) if self.known_names else 0
@@ -595,6 +717,7 @@ class SmartAssistant:
                     self._saved_samples = samples
                 else:
                     self._saved_samples = {}
+
                 self.log_to_gui(f"Загружено лиц: {len(self.known_names)}.")
             except Exception as e:
                 self.log_to_gui(f"Ошибка загрузки базы лиц: {e}")
@@ -612,7 +735,8 @@ class SmartAssistant:
     def delete_person(self, name):
         name = name.lower().strip()
         with self.faces_lock:
-            label_to_remove = next((lbl for lbl, n in self.known_names.items() if n.lower() == name), None)
+            label_to_remove = next((lbl for lbl, n in self.known_names.items()
+                                     if n.lower() == name), None)
             if label_to_remove is None:
                 self.speak(f"Не нашёл {name} в базе.")
                 return
@@ -621,7 +745,9 @@ class SmartAssistant:
             if hasattr(self, '_saved_samples') and label_to_remove in self._saved_samples:
                 del self._saved_samples[label_to_remove]
 
-            self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=8, grid_x=8, grid_y=8)
+            # Переобучаем модель на оставшихся данных
+            self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=8,
+                                                                   grid_x=8, grid_y=8)
             all_images, all_labels = [], []
             for label, imgs in getattr(self, '_saved_samples', {}).items():
                 for img in imgs:
@@ -638,6 +764,7 @@ class SmartAssistant:
         self.log_to_gui(f"Удалён: {name}")
 
     def get_face_features(self, face_img):
+        """Подготовка изображения лица для LBPH: grayscale, resize, CLAHE."""
         gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, (200, 200))
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -666,7 +793,8 @@ class SmartAssistant:
         try:
             while len(collected) < 25 and self.is_listening:
                 ret, frame = cap.read()
-                if not ret: break
+                if not ret:
+                    break
                 frame = cv2.flip(frame, 1)
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 faces = self.face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(100, 100))
@@ -675,20 +803,20 @@ class SmartAssistant:
                     collected.append(feat)
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     time.sleep(0.08)
-
-                # ИСПРАВЛЕНО: Используем draw_text_safe для кириллицы
-                frame = self.draw_text_safe(frame, f"Снимков: {len(collected)}/25", (15, 35), (0, 255, 255))
-
-                # ИСПРАВЛЕНО: Заголовок окна на английском, чтобы не было ???
-                cv2.imshow("Add Face (q - cancel)", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'): break
+                frame = self.draw_text_safe(frame, f"Снимков: {len(collected)}/25",
+                                             (15, 15), (0, 255, 255))
+                cv2.imshow("Добавление лица (q - отмена)", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
         finally:
             cap.release()
             cv2.destroyAllWindows()
 
         if len(collected) >= 8:
             with self.faces_lock:
-                existing_label = next((lbl for lbl, n in self.known_names.items() if n.lower() == name.lower()), None)
+                # Если имя уже есть — дополняем его данные, иначе создаём новую метку
+                existing_label = next((lbl for lbl, n in self.known_names.items()
+                                       if n.lower() == name.lower()), None)
                 if existing_label is not None:
                     label = existing_label
                 else:
@@ -696,7 +824,8 @@ class SmartAssistant:
                     self.next_label_id += 1
                     self.known_names[label] = name
 
-                if not hasattr(self, '_saved_samples'): self._saved_samples = {}
+                if not hasattr(self, '_saved_samples'):
+                    self._saved_samples = {}
                 self._saved_samples.setdefault(label, [])
                 self._saved_samples[label].extend(collected)
 
@@ -709,7 +838,7 @@ class SmartAssistant:
                 self.model_trained = True
 
             self.save_face_data()
-            self.speak(f"Запомнил, как {name}. Данные сохранены.")
+            self.speak(f"Запомнил, как {name}. Готов узнавать при следующей встрече.")
         else:
             self.speak("Не удалось сделать достаточно снимков. Попробуйте ещё раз.")
 
@@ -719,88 +848,108 @@ class SmartAssistant:
             self.is_recognizing_faces = False
             return
 
-        log_path = os.path.join(LOG_DIR, f"recognition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        # Открываем лог-файл на время сессии распознавания
+        log_path = os.path.join(
+            LOG_DIR, f"recognition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         try:
             self.recognition_log_file = open(log_path, 'w', encoding='utf-8')
-            self.recognition_log_file.write(f"Лог распознавания. Начало сессии: {datetime.now()}\n")
+            self.recognition_log_file.write(
+                f"Лог распознавания. Начало сессии: {datetime.now()}\n")
             self.recognition_log_file.write("Алгоритм: " + " | ".join(ALGORITHM_DESCRIPTION) + "\n\n")
         except Exception as e:
             self.log_to_gui(f"Не удалось открыть лог-файл: {e}")
             self.recognition_log_file = None
 
+        # last_result хранит последний посчитанный результат распознавания.
+        # Используется, чтобы вероятность/имя оставались на экране ПОСТОЯННО
+        # (пока открыто окно камеры), а не мигали между кадрами — даже если
+        # детектор лиц на долю секунды не нашёл лицо.
+        self.last_results = {"main": None}
+
         cap = cv2.VideoCapture(0)
-        last_time = 0
         try:
             while self.is_recognizing_faces:
                 ret, frame = cap.read()
-                if not ret: break
+                if not ret:
+                    break
                 frame = cv2.flip(frame, 1)
                 gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 faces = self.face_cascade.detectMultiScale(gray_full, 1.1, 5, minSize=(100, 100))
 
                 now = time.time()
-                for (x, y, w, h) in faces:
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-                    if now - last_time > 1.0:
-                        last_time = now
-                        feat = self.get_face_features(frame[y:y + h, x:x + w])
+                if len(faces) > 0:
+                    # Берём самое крупное лицо в кадре (наиболее вероятный
+                    # "главный" объект, если в кадре несколько лиц).
+                    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
 
-                        with self.faces_lock:
-                            try:
-                                label, distance = self.recognizer.predict(feat)
-                            except cv2.error:
-                                continue
+                    feat = self.get_face_features(frame[y:y + h, x:x + w])
+                    with self.faces_lock:
+                        try:
+                            label, distance = self.recognizer.predict(feat)
                             name = self.known_names.get(label)
+                        except cv2.error:
+                            label, distance, name = None, 999.0, None
 
-                        confidence_pct = int(max(0, min(100, 100 - distance)))
-                        is_match = (name is not None) and (distance < LBPH_DISTANCE_THRESHOLD)
+                    confidence_pct = int(max(0, min(100, 100 - distance)))
+                    is_match = (name is not None) and (distance < LBPH_DISTANCE_THRESHOLD)
+                    display_name = name if is_match else UNKNOWN_LABEL
 
-                        if is_match:
-                            color = (0, 255, 0)
-                            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 3)
-                            frame = self.draw_text_safe(frame, name, (x, y - 40), color)
-                            self._log_recognition(name, confidence_pct, distance)
+                    self.last_results["main"] = {
+                        "name": display_name,
+                        "is_match": is_match,
+                        "confidence_pct": confidence_pct,
+                        "distance": distance,
+                        "box": (x, y, w, h),
+                    }
 
-                            self.last_name = name
-                            self.last_confidence = confidence_pct
-                            self.last_distance = distance
+                    if is_match:
+                        if name != self.last_spoken_name:
+                            self.last_spoken_name = name
+                            self.speak(f"Это {name}!")
+                    else:
+                        self.last_spoken_name = ""
+                        if now - self.last_spoken_time > self.speak_cooldown:
+                            self.last_spoken_time = now
+                            self.speak(UNKNOWN_PHRASE)
 
-                            if name != self.last_greeted_name or (now - self.last_greeted_time > self.speak_cooldown):
-                                self.speak(f"Привет, {name}!")
-                                self.last_greeted_name = name
-                                self.last_greeted_time = now
-                        else:
-                            color = (0, 0, 255)
-                            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                            frame = self.draw_text_safe(frame, "Неизвестный", (x, y - 40), color)
-                            if now - self.last_spoken_time > self.speak_cooldown:
-                                self.last_spoken_time = now
-                                self.speak(UNKNOWN_PHRASE)
+                    self._log_recognition(display_name, confidence_pct, distance)
 
-                            self._log_recognition("Unknown", confidence_pct, distance)
+                # Отрисовываем последний известный результат на каждом
+                # кадре — вероятность не мигает, пока окно камеры открыто.
+                result = self.last_results.get("main")
+                if result:
+                    x, y, w, h = result["box"]
+                    color = (0, 255, 0) if result["is_match"] else (0, 0, 255)
+                    thickness = 3 if result["is_match"] else 2
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
+                    # Имя рисуем кириллицей через PIL (cv2.putText не умеет кириллицу)
+                    frame = self.draw_text_safe(frame, result["name"], (x, max(0, y - 40)), color)
 
-                            self.last_name = "Неизвестный"
-                            self.last_confidence = confidence_pct
-                            self.last_distance = distance
+                    # Вероятность — верхний левый угол, на экране постоянно.
+                    frame = self.draw_text_safe(
+                        frame, f"Вероятность: {result['confidence_pct']}%",
+                        (15, 15), (0, 255, 255))
+                    frame = self.draw_text_safe(
+                        frame, f"Расстояние: {result['distance']:.1f}",
+                        (15, 50), (0, 255, 255))
 
-                frame = self.draw_text_safe(frame, f"Имя: {self.last_name}", (15, 35), (0, 255, 255))
-                frame = self.draw_text_safe(frame, f"Уверенность: {self.last_confidence}%", (15, 75), (0, 255, 255))
-                frame = self.draw_text_safe(frame, f"Дистанция: {self.last_distance:.1f}", (15, 115), (0, 255, 255))
-
+                # Описание алгоритма — нижний правый угол, видно всегда,
+                # независимо от того, найдено лицо в данном кадре или нет.
                 h_frame, w_frame, _ = frame.shape
                 start_y = h_frame - 20 * (len(ALGORITHM_DESCRIPTION) + 1)
                 for i, line in enumerate(ALGORITHM_DESCRIPTION):
                     cv2.putText(frame, line, (w_frame - 480, start_y + i * 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-                # ИСПРАВЛЕНО: Заголовок окна на английском
-                cv2.imshow("Recognition (q - exit)", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'): break
+                cv2.imshow("Распознавание (q - выход)", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
         finally:
             cap.release()
             cv2.destroyAllWindows()
             self.is_recognizing_faces = False
+            self.last_results = {}
             if self.recognition_log_file:
                 self.recognition_log_file.write(f"\nКонец сессии: {datetime.now()}\n")
                 self.recognition_log_file.close()
@@ -809,7 +958,7 @@ class SmartAssistant:
 
     def _log_recognition(self, name, confidence_pct, distance):
         line = (f"{datetime.now().strftime('%H:%M:%S')} | "
-                f"Имя: {name} | Confidence: {confidence_pct}% | Distance: {distance:.2f}")
+                f"Имя: {name} | Вероятность: {confidence_pct}% | Расстояние: {distance:.2f}")
         if self.recognition_log_file:
             try:
                 self.recognition_log_file.write(line + "\n")
@@ -843,10 +992,7 @@ def simpledialog_askstring(title, prompt):
     entry = ttk.Entry(dialog, textvariable=result, width=30)
     entry.pack(pady=5)
     entry.focus()
-
-    def on_ok(): dialog.destroy()
-
-    ttk.Button(dialog, text="OK", command=on_ok).pack(pady=5)
+    ttk.Button(dialog, text="OK", command=dialog.destroy).pack(pady=5)
     dialog.wait_window()
     return result.get()
 
@@ -855,20 +1001,16 @@ def main():
     assistant = None
     try:
         assistant = SmartAssistant()
-        assistant.speak("Здравствуйте. Я голосовой помощник Друг. Для команд начинайте фразу со слова Друг.")
-
-        def on_close():
-            assistant.cleanup()
-            assistant.root.destroy()
-
-        assistant.root.protocol("WM_DELETE_WINDOW", on_close)
+        assistant.speak("Система запущена. Я твой друг и готов помогать.")
+        assistant.root.protocol("WM_DELETE_WINDOW",
+                                 lambda: [assistant.cleanup(), assistant.root.quit(), sys.exit(0)])
         assistant.root.mainloop()
     except KeyboardInterrupt:
         pass
     finally:
         if assistant is not None:
             assistant.cleanup()
-            cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
